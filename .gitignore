@@ -1,0 +1,5 @@
+session-keeper
+Session Keeper.app/
+*.zip
+.DS_Store
+.idea/
