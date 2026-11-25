@@ -4,7 +4,6 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"sync/atomic"
 	"testing"
 	"time"
 
@@ -12,78 +11,104 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
-func TestTriggerAuth_Deduplication(t *testing.T) {
+// blockingAuth stubs Monitor.authenticate: each call reports its background
+// flag on calls and blocks until its context is cancelled.
+func blockingAuth(calls chan<- bool) func(context.Context, SSOInstance, bool) (*SSOToken, error) {
+	return func(ctx context.Context, _ SSOInstance, background bool) (*SSOToken, error) {
+		calls <- background
+		<-ctx.Done()
+		return nil, ctx.Err()
+	}
+}
+
+func TestTriggerAuth_BackgroundSkippedWhileInFlight(t *testing.T) {
 	mon := NewMonitor(nil)
-
+	calls := make(chan bool, 2)
+	mon.authenticate = blockingAuth(calls)
+	mon.connected = func(context.Context) bool { return true }
 	inst := SSOInstance{StartURL: "https://example.awsapps.com/start", Region: "us-east-1"}
-
-	// Manually mark as in-flight
-	mon.authInFlight.Store(inst.StartURL, true)
-
-	// TriggerAuth should return immediately without doing anything
-	ctx, cancel := context.WithTimeout(context.Background(), 100*time.Millisecond)
+	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
+
+	go mon.TriggerAuth(ctx, inst, false)
+	<-calls
+	mon.TriggerAuth(ctx, inst, true)
+
+	require.Empty(t, calls)
+}
+
+func TestTriggerAuth_ManualSupersedesInFlight(t *testing.T) {
+	mon := NewMonitor(nil)
+	calls := make(chan bool, 2)
+	mon.authenticate = blockingAuth(calls)
+	mon.connected = func(context.Context) bool { return true }
+	inst := SSOInstance{StartURL: "https://example.awsapps.com/start", Region: "us-east-1"}
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	go mon.TriggerAuth(ctx, inst, true)
+	<-calls
+	go mon.TriggerAuth(ctx, inst, false)
+
+	require.False(t, <-calls)
+}
+
+func TestTriggerAuth_SupersededAttemptKeepsSlot(t *testing.T) {
+	mon := NewMonitor(nil)
+	calls := make(chan bool, 2)
+	mon.authenticate = blockingAuth(calls)
+	mon.connected = func(context.Context) bool { return true }
+	inst := SSOInstance{StartURL: "https://example.awsapps.com/start", Region: "us-east-1"}
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	go mon.TriggerAuth(ctx, inst, true)
+	<-calls
+	go mon.TriggerAuth(ctx, inst, false)
+	<-calls
+
+	require.True(t, mon.authInFlight(inst.StartURL))
+}
+
+func TestTriggerAuth_BackgroundWaitsForConnectivity(t *testing.T) {
+	mon := NewMonitor(nil)
+	calls := make(chan bool, 1)
+	mon.authenticate = blockingAuth(calls)
+	mon.connected = func(context.Context) bool { return false }
+	inst := SSOInstance{StartURL: "https://example.awsapps.com/start", Region: "us-east-1"}
+	ctx, cancel := context.WithCancel(context.Background())
 
 	done := make(chan struct{})
 	go func() {
-		mon.TriggerAuth(ctx, inst, false)
+		mon.TriggerAuth(ctx, inst, true)
 		close(done)
 	}()
+	require.Equal(t, StateOffline, (<-mon.StatusCh()).State)
+	cancel()
+	<-done
 
-	select {
-	case <-done:
-		// Returned immediately — deduplication worked
-	case <-time.After(1 * time.Second):
-		t.Fatal("TriggerAuth did not return; deduplication failed")
-	}
-
-	mon.authInFlight.Delete(inst.StartURL)
+	require.Empty(t, calls)
 }
 
-func TestTriggerAuth_ConcurrentCalls(t *testing.T) {
-	// Keep the real Authenticate these calls run away from the user's own
-	// token and client-registration cache.
+func TestCheckAll_ExpiredTokenShowsRenewingWhileAutoAuthRuns(t *testing.T) {
 	t.Setenv("HOME", t.TempDir())
-	mon := NewMonitor(nil)
-
 	inst := SSOInstance{StartURL: "https://example.awsapps.com/start", Region: "us-east-1"}
-
-	// Track how many times auth actually runs (past the dedup check)
-	var authCount int32
-
-	// Pre-load the authInFlight to block both goroutines
-	// Then release and see only one gets through at a time
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	require.NoError(t, SaveToken(&SSOToken{
+		StartURL:  inst.StartURL,
+		Region:    inst.Region,
+		ExpiresAt: time.Now().UTC().Add(-time.Minute).Format(timeFormat),
+	}))
+	mon := NewMonitor([]SSOInstance{inst})
+	calls := make(chan bool, 1)
+	mon.authenticate = blockingAuth(calls)
+	mon.connected = func(context.Context) bool { return true }
+	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
-	// Launch two concurrent TriggerAuth calls
-	// Both will try Authenticate which will fail (no AWS creds in test),
-	// but only one should get past LoadOrStore
-	done1 := make(chan struct{})
-	done2 := make(chan struct{})
+	mon.checkAll(ctx)
+	<-calls
 
-	// Temporarily store to simulate in-flight, then delete to let the real calls race
-	mon.authInFlight.Store(inst.StartURL, true)
-
-	go func() {
-		mon.authInFlight.Delete(inst.StartURL)
-		mon.TriggerAuth(ctx, inst, false)
-		atomic.AddInt32(&authCount, 1)
-		close(done1)
-	}()
-	go func() {
-		// Small delay to let first goroutine claim the lock
-		time.Sleep(10 * time.Millisecond)
-		mon.TriggerAuth(ctx, inst, false)
-		atomic.AddInt32(&authCount, 1)
-		close(done2)
-	}()
-
-	<-done1
-	<-done2
-
-	// Both calls completed (one ran auth, one was deduplicated)
-	require.Equal(t, int32(2), atomic.LoadInt32(&authCount))
+	require.Equal(t, StateRenewing, (<-mon.StatusCh()).State)
 }
 
 func TestMonitorRun_ExitsOnContextCancel(t *testing.T) {
@@ -152,6 +177,16 @@ func TestRefreshable_OtherErrorsStayRetryable(t *testing.T) {
 	mon.noteRefreshFailure(url, token, errors.New("dial tcp: i/o timeout"))
 
 	require.True(t, mon.refreshable(url, token))
+}
+
+func TestShouldAutoAuth_RetriedAfterWake(t *testing.T) {
+	mon := NewMonitor(nil)
+	const url = "https://example.awsapps.com/start"
+	mon.autoAuthGivenUp.Store(url, true)
+
+	mon.ResetAutoAuth()
+
+	require.True(t, mon.shouldAutoAuth(url))
 }
 
 func TestWaitForConnectivity_ContextCancel(t *testing.T) {

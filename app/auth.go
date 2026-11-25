@@ -39,6 +39,8 @@ const (
 	// minutes.
 	interactiveWaitTimeout = 5 * time.Minute
 	backgroundWaitTimeout  = 20 * time.Second
+
+	chromeExitTimeout = 5 * time.Second
 )
 
 func newOIDCClient(ctx context.Context, region string) (*ssooidc.Client, error) {
@@ -145,13 +147,13 @@ func Authenticate(ctx context.Context, inst SSOInstance, background bool) (*SSOT
 	if background {
 		waitTimeout = backgroundWaitTimeout
 	}
-	waitCtx, cancel := context.WithTimeout(ctx, waitTimeout)
+	waitCtx, cancel := withWallClockTimeout(ctx, waitTimeout)
 	defer cancel()
 
 	var code string
 	select {
 	case <-waitCtx.Done():
-		return nil, fmt.Errorf("waiting for sign-in: %w", waitCtx.Err())
+		return nil, fmt.Errorf("waiting for sign-in: %w", context.Cause(waitCtx))
 	case r := <-resultCh:
 		if r.errDesc != "" {
 			return nil, fmt.Errorf("authorize: %s", r.errDesc)
@@ -183,6 +185,29 @@ func Authenticate(ctx context.Context, inst SSOInstance, background bool) (*SSOT
 	log.Printf("Token obtained via browser sign-in (expires in %s)",
 		formatDuration(time.Duration(tokenResp.ExpiresIn)*time.Second))
 	return token, nil
+}
+
+// withWallClockTimeout is like context.WithTimeout, except that time the
+// machine spends asleep counts toward d.
+func withWallClockTimeout(parent context.Context, d time.Duration) (context.Context, context.CancelFunc) {
+	deadline := time.Now().Add(d).Round(0)
+	ctx, cancel := context.WithCancelCause(parent)
+	go func() {
+		ticker := time.NewTicker(max(min(d, time.Second), time.Millisecond))
+		defer ticker.Stop()
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case now := <-ticker.C:
+				if !now.Round(0).Before(deadline) {
+					cancel(context.DeadlineExceeded)
+					return
+				}
+			}
+		}
+	}()
+	return ctx, func() { cancel(context.Canceled) }
 }
 
 func pkce() (verifier, challenge string) {
@@ -393,11 +418,43 @@ func openHeadlessCookieProfile(rawURL string) func() {
 	}
 	log.Printf("headless cookie profile: launched against profile %q", chromeProfileLabel(profileDir))
 
-	return func() {
-		// The real Chrome process isn't a child of ours (open -a launched
-		// it via Launch Services), so it's found by its unique, disposable
-		// --user-data-dir rather than a held *os.Process.
-		_ = exec.Command("pkill", "-f", tmpProfile).Run()
-		cleanupDir()
+	return func() { removeChromeProfile(tmpProfile) }
+}
+
+// removeChromeProfile stops the headless Chrome using userDataDir and deletes
+// the directory.
+func removeChromeProfile(userDataDir string) {
+	// The real Chrome process isn't a child of ours (open -a launched
+	// it via Launch Services), so it's found by its unique, disposable
+	// --user-data-dir rather than a held *os.Process.
+	_ = exec.Command("pkill", "-f", userDataDir).Run()
+	if !waitForExit(userDataDir, chromeExitTimeout) {
+		_ = exec.Command("pkill", "-KILL", "-f", userDataDir).Run()
+		waitForExit(userDataDir, chromeExitTimeout)
+	}
+	os.RemoveAll(userDataDir)
+}
+
+// waitForExit reports whether every process whose command line contains
+// pattern exited within timeout.
+func waitForExit(pattern string, timeout time.Duration) bool {
+	deadline := time.Now().Add(timeout)
+	for {
+		if exec.Command("pgrep", "-f", pattern).Run() != nil {
+			return true
+		}
+		if time.Now().After(deadline) {
+			return false
+		}
+		time.Sleep(100 * time.Millisecond)
+	}
+}
+
+// removeStaleChromeProfiles deletes headless Chrome profiles left behind by
+// earlier runs.
+func removeStaleChromeProfiles() {
+	dirs, _ := filepath.Glob(filepath.Join(os.TempDir(), ExecName+"-chrome-*"))
+	for _, dir := range dirs {
+		removeChromeProfile(dir)
 	}
 }

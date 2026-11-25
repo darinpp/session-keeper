@@ -54,21 +54,36 @@ func tokenStatus(token *SSOToken, inst SSOInstance) SessionStatus {
 	}
 }
 
+// authAttempt is one in-flight sign-in.
+type authAttempt struct {
+	ctx    context.Context
+	cancel context.CancelFunc
+	done   chan struct{} // closed once the attempt has finished
+}
+
 // Monitor watches SSO token expiry and attempts renewal.
 type Monitor struct {
 	instances        []SSOInstance
 	statusCh         chan SessionStatus
-	authInFlight     sync.Map       // tracks in-progress auth per StartURL
-	lastRenewAttempt sync.Map       // per-StartURL time.Time of last failed refresh
-	autoAuthGivenUp  sync.Map       // per-StartURL: true once an automatic re-auth has been tried this expiry
-	deadRefresh      sync.Map       // per-StartURL: refresh token string AWS rejected with invalid_grant
-	wg               sync.WaitGroup // tracks in-flight auth attempts for graceful shutdown
+	checkNowCh       chan struct{}
+	authenticate     func(ctx context.Context, inst SSOInstance, background bool) (*SSOToken, error)
+	connected        func(ctx context.Context) bool
+	mu               sync.Mutex
+	attempts         map[string]*authAttempt // in-flight sign-in per StartURL, guarded by mu
+	lastRenewAttempt sync.Map                // per-StartURL time.Time of last failed refresh
+	autoAuthGivenUp  sync.Map                // per-StartURL: true once an automatic re-auth has been tried this expiry
+	deadRefresh      sync.Map                // per-StartURL: refresh token string AWS rejected with invalid_grant
+	wg               sync.WaitGroup          // tracks in-flight auth attempts for graceful shutdown
 }
 
 func NewMonitor(instances []SSOInstance) *Monitor {
 	return &Monitor{
-		instances: instances,
-		statusCh:  make(chan SessionStatus, 1),
+		instances:    instances,
+		statusCh:     make(chan SessionStatus, 1),
+		checkNowCh:   make(chan struct{}, 1),
+		authenticate: Authenticate,
+		connected:    checkConnectivity,
+		attempts:     make(map[string]*authAttempt),
 	}
 }
 
@@ -124,7 +139,7 @@ func waitForConnectivity(ctx context.Context) bool {
 
 func (m *Monitor) authenticateWithRetry(ctx context.Context, inst SSOInstance, background bool) (*SSOToken, error) {
 	for {
-		token, err := Authenticate(ctx, inst, background)
+		token, err := m.authenticate(ctx, inst, background)
 		if err == nil {
 			return token, nil
 		}
@@ -142,27 +157,106 @@ func (m *Monitor) authenticateWithRetry(ctx context.Context, inst SSOInstance, b
 }
 
 // TriggerAuth runs one sign-in for inst — silent (background) when the
-// monitor starts it, visible when the user clicks Login — unless one is
-// already in flight for that instance.
+// monitor starts it, visible when the user clicks Login. A background sign-in
+// is skipped if one is already in flight for that instance; a visible one
+// cancels whatever is in flight and replaces it.
 func (m *Monitor) TriggerAuth(ctx context.Context, inst SSOInstance, background bool) {
-	if _, loaded := m.authInFlight.LoadOrStore(inst.StartURL, true); loaded {
+	a, prev := m.beginAttempt(ctx, inst.StartURL, background)
+	if a == nil {
 		return
 	}
 	m.wg.Add(1)
 	defer m.wg.Done()
-	defer m.authInFlight.Delete(inst.StartURL)
+	defer m.endAttempt(inst.StartURL, a)
+
+	if prev != nil {
+		<-prev.done
+	}
+	if a.ctx.Err() != nil {
+		return
+	}
+	if background && !m.awaitConnectivity(a.ctx, inst) {
+		return
+	}
 
 	m.send(SessionStatus{State: StateRenewing, Instance: inst})
 
-	token, err := m.authenticateWithRetry(ctx, inst, background)
+	token, err := m.authenticateWithRetry(a.ctx, inst, background)
 	if err != nil {
 		log.Printf("authentication failed for %s: %v", inst.StartURL, err)
-		m.send(SessionStatus{State: StateExpired, Instance: inst})
+		if m.isCurrentAttempt(inst.StartURL, a) {
+			m.send(SessionStatus{State: StateExpired, Instance: inst})
+		}
 		return
 	}
 
 	m.autoAuthGivenUp.Delete(inst.StartURL)
 	m.sendStatus(token, inst)
+}
+
+// awaitConnectivity blocks until the network is reachable, reporting false if
+// ctx ends first.
+func (m *Monitor) awaitConnectivity(ctx context.Context, inst SSOInstance) bool {
+	if m.connected(ctx) {
+		return true
+	}
+	log.Printf("offline, waiting for connectivity before signing in to %s", inst.StartURL)
+	m.send(SessionStatus{State: StateOffline, Instance: inst})
+	return waitForConnectivity(ctx)
+}
+
+// beginAttempt registers a new sign-in for startURL and returns it along with
+// the attempt it superseded, if any; it returns a nil attempt when background
+// and one is already in flight.
+func (m *Monitor) beginAttempt(ctx context.Context,
+	startURL string, background bool,
+) (a, prev *authAttempt) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	prev = m.attempts[startURL]
+	if prev != nil {
+		if background {
+			return nil, nil
+		}
+		log.Printf("cancelling in-flight sign-in for %s in favour of a manual one", startURL)
+		prev.cancel()
+	}
+	attemptCtx, cancel := context.WithCancel(ctx)
+	a = &authAttempt{ctx: attemptCtx, cancel: cancel, done: make(chan struct{})}
+	m.attempts[startURL] = a
+	return a, prev
+}
+
+// endAttempt marks a finished and unregisters it unless it was superseded.
+func (m *Monitor) endAttempt(startURL string, a *authAttempt) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	a.cancel()
+	close(a.done)
+	if m.attempts[startURL] == a {
+		delete(m.attempts, startURL)
+	}
+}
+
+func (m *Monitor) isCurrentAttempt(startURL string, a *authAttempt) bool {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return m.attempts[startURL] == a
+}
+
+func (m *Monitor) authInFlight(startURL string) bool {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	_, ok := m.attempts[startURL]
+	return ok
+}
+
+// CheckNow asks Run to check every instance without waiting for its next tick.
+func (m *Monitor) CheckNow() {
+	select {
+	case m.checkNowCh <- struct{}{}:
+	default:
+	}
 }
 
 func (m *Monitor) Run(ctx context.Context) {
@@ -176,6 +270,8 @@ func (m *Monitor) Run(ctx context.Context) {
 		case <-ctx.Done():
 			return
 		case <-ticker.C:
+			m.checkAll(ctx)
+		case <-m.checkNowCh:
 			m.checkAll(ctx)
 		}
 	}
@@ -192,7 +288,7 @@ func refreshWithTimeout(ctx context.Context, inst SSOInstance, token *SSOToken) 
 
 func (m *Monitor) checkAll(ctx context.Context) {
 	for _, inst := range m.instances {
-		if _, inFlight := m.authInFlight.Load(inst.StartURL); inFlight {
+		if m.authInFlight(inst.StartURL) {
 			continue
 		}
 
@@ -201,11 +297,12 @@ func (m *Monitor) checkAll(ctx context.Context) {
 			if token != nil && m.tryRefresh(ctx, inst, token) {
 				continue
 			}
-			m.send(SessionStatus{State: StateExpired, Instance: inst})
 			if m.shouldAutoAuth(inst.StartURL) {
 				m.autoAuthGivenUp.Store(inst.StartURL, true)
 				go m.TriggerAuth(ctx, inst, true)
+				continue
 			}
+			m.send(SessionStatus{State: StateExpired, Instance: inst})
 			continue
 		}
 
@@ -277,11 +374,19 @@ func (m *Monitor) noteRefreshFailure(startURL string, token *SSOToken, err error
 }
 
 // shouldAutoAuth reports whether an expired token is still worth an automatic
-// re-authentication attempt. A failed attempt can't succeed by retrying on
-// the next tick — the identity provider needs a fresh interactive login
-// either way — so it's tried at most once per expiry and then left alone
-// until a TriggerAuth success (automatic or manual) resets it.
+// re-authentication attempt: it's tried at most once per expiry, then left
+// alone until a TriggerAuth success or ResetAutoAuth.
 func (m *Monitor) shouldAutoAuth(startURL string) bool {
 	_, gaveUp := m.autoAuthGivenUp.Load(startURL)
 	return !gaveUp
+}
+
+// ResetAutoAuth allows one more automatic re-authentication attempt for every
+// instance whose previous attempt failed.
+func (m *Monitor) ResetAutoAuth() {
+	m.autoAuthGivenUp.Range(func(startURL, _ any) bool {
+		log.Printf("re-enabling automatic sign-in for %s", startURL)
+		m.autoAuthGivenUp.Delete(startURL)
+		return true
+	})
 }

@@ -91,7 +91,9 @@ func onReady() {
 	shutdownCancel = cancel
 	shutdownMon = mon
 
+	removeStaleChromeProfiles()
 	go mon.Run(ctx)
+	OnScreensWake(mon.ResetAutoAuth)
 
 	// UI update ticker for countdown
 	uiTicker := time.NewTicker(500 * time.Millisecond)
@@ -126,6 +128,11 @@ func onReady() {
 				}
 				if cachedToken != nil {
 					lastStatus = tokenStatus(cachedToken, lastStatus.Instance)
+					if lastStatus.State == StateExpired {
+						cachedToken = nil
+						lastStatus.State = StateRenewing
+						mon.CheckNow()
+					}
 					updateUI(mStatus, &lastStatus)
 				}
 			case <-mTokenRefresh.ClickedCh:

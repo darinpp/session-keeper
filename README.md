@@ -23,7 +23,7 @@ To remove it: disable **Start at Login**, then drag `Session Keeper.app` to the 
 
 The menu-bar icon is a moon phase showing how much of the current token's lifetime is left (🌕 fresh → 🌑 about to expire), 🚫 for no session/error, 📡 for offline/retrying. Click it for:
 
-- **Login** — re-authenticate now (opens the browser)
+- **Login** — re-authenticate now (opens the browser, replacing any renewal already in progress)
 - **Token** — test helpers: **Refresh** (expire the access token, keep the refresh token), **Federation** (expire and invalidate the refresh token, forcing a fresh sign-in), **Remove** (same as Federation, but skips the silent browser method to test the fallback)
 - **Chrome Profile** — choose which Chrome profile silent renewal copies cookies from; defaults to whichever profile Chrome itself would open
 - **Start at Login** — open automatically when you log in
@@ -32,7 +32,7 @@ The menu-bar icon is a moon phase showing how much of the current token's lifeti
 
 ## Silent renewal
 
-When a session needs to re-authenticate automatically, the app launches a disposable, headless copy of Chrome using an isolated copy of the chosen profile's cookies — nothing ever becomes visible, and the copy is deleted immediately after. This requires Google Chrome and `sqlite3` (bundled with macOS) to be installed. If it's ever unavailable or fails, the app does nothing further automatically and waits for a manual **Login** click.
+When a session needs to re-authenticate automatically, the app launches a disposable, headless copy of Chrome using an isolated copy of the chosen profile's cookies — nothing ever becomes visible, and the copy is deleted immediately after. An automatic attempt waits until the network is reachable. This requires Google Chrome and `sqlite3` (bundled with macOS) to be installed. If it's ever unavailable or fails, the app tries once more the next time the screens wake (e.g. when you open the lid) and otherwise waits for a manual **Login** click.
 
 ## Security Q&A
 
