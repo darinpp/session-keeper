@@ -32,13 +32,11 @@ const (
 	ssoScope         = "sso:account:access"
 
 	// interactiveWaitTimeout bounds how long a visible, user-initiated
-	// sign-in waits for the browser redirect. backgroundWaitTimeout bounds
-	// a silent/background attempt far more tightly, so a flow that can't
-	// complete silently (e.g. needs real interactive login) fails fast
-	// instead of leaving a real, visible tab sitting in the browser for
-	// minutes.
+	// sign-in waits for the browser redirect. backgroundWaitTimeout bounds a
+	// silent headless attempt — nothing visible is ever shown, so it mainly
+	// needs headroom for a cold Chrome start before the redirect lands.
 	interactiveWaitTimeout = 5 * time.Minute
-	backgroundWaitTimeout  = 20 * time.Second
+	backgroundWaitTimeout  = 90 * time.Second
 
 	chromeExitTimeout = 5 * time.Second
 )
